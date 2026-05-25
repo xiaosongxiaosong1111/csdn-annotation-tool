@@ -166,7 +166,25 @@ def parse_article(page_html: str) -> Article:
     parser = TextBlockParser()
     parser.feed(body)
     paragraphs = dedupe_blocks(parser.blocks)
+    if not paragraphs and page_html.strip():
+        return parse_plain_text_article(page_html)
     title = extract_title(page_html, paragraphs)
+    return Article(title=title, paragraphs=paragraphs)
+
+
+def parse_plain_text_article(text: str) -> Article:
+    lines = [normalize_text(line) for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    lines = [line for line in lines if line]
+    if not lines:
+        return Article(title="未识别标题", paragraphs=[])
+
+    title = lines[0][:80]
+    blocks = re.split(r"\n\s*\n+", text.replace("\r\n", "\n").replace("\r", "\n"))
+    paragraphs = dedupe_blocks(blocks)
+    if len(paragraphs) <= 1:
+        paragraphs = dedupe_blocks(lines)
+    if paragraphs and normalize_text(paragraphs[0]) == normalize_text(title):
+        paragraphs = paragraphs[1:] or paragraphs
     return Article(title=title, paragraphs=paragraphs)
 
 

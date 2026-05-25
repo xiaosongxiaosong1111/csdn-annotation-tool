@@ -15,6 +15,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.error
+import urllib.parse
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,16 +27,63 @@ from csdn_annotation_draft import AnnotationDraft, build_drafts, fetch_html, par
 
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csdn_annotation_ui.log")
 CODEX_TIMEOUT_SECONDS = 180
+BROWSER_IMPORT: Dict[str, Any] = {"url": "", "title": "", "html": "", "receivedAt": ""}
+BROWSER_IMPORT_LOCK = threading.Lock()
 
 
 def log_event(message: str) -> None:
     line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as fp:
             fp.write(line + "\n")
     except OSError:
         pass
+
+
+def safe_console_print(message: str) -> None:
+    try:
+        print(message, flush=True)
+    except Exception:
+        log_event(message)
+
+
+def client_error_message(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        server = exc.headers.get("Server", "")
+        if exc.code == 521 and server.upper() == "WAF":
+            return (
+                "抓取网页失败：CSDN 返回了 WAF 反爬校验（HTTP 521），本地脚本不能直接读取这篇文章。"
+                "请在浏览器正常打开文章，复制文章标题和正文，回到工具页面粘贴到“文章正文 / HTML”文本框，"
+                "也可以点击“从剪贴板粘贴”后再生成。"
+            )
+        reason = str(exc.reason or "").strip()
+        return f"抓取网页失败：目标网站返回 HTTP {exc.code}{('，' + reason) if reason else ''}。"
+    if isinstance(exc, urllib.error.URLError):
+        return f"抓取网页失败：无法连接目标网站，{exc.reason}。可以改用粘贴 HTML 方式生成。"
+    return str(exc)
+
+
+def error_status(exc: Exception) -> HTTPStatus:
+    if isinstance(exc, (urllib.error.HTTPError, urllib.error.URLError)):
+        return HTTPStatus.BAD_GATEWAY
+    return HTTPStatus.BAD_REQUEST
+
+
+def log_exception(exc: Exception) -> None:
+    if isinstance(exc, urllib.error.HTTPError):
+        server = exc.headers.get("Server", "")
+        request_id = exc.headers.get("X-Request-Id", "")
+        log_event(
+            "request failed "
+            f"type=HTTPError code={exc.code} reason={exc.reason!r} "
+            f"server={server!r} requestId={request_id!r}"
+        )
+        return
+    log_event(f"request failed type={type(exc).__name__} error={exc}")
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -134,6 +183,12 @@ INDEX_HTML = r"""<!doctype html>
       margin-top: 16px;
       flex-wrap: wrap;
     }
+    .import-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }
     button {
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -157,6 +212,9 @@ INDEX_HTML = r"""<!doctype html>
       margin-top: 10px;
       color: var(--muted);
       line-height: 1.6;
+    }
+    .hint.small {
+      font-size: 13px;
     }
     .status {
       min-height: 22px;
@@ -258,8 +316,14 @@ INDEX_HTML = r"""<!doctype html>
         <label for="url">文章 URL</label>
         <input id="url" type="url" placeholder="https://blog.csdn.net/..." />
 
-        <label for="html">或粘贴文章 HTML</label>
-        <textarea id="html" placeholder="URL 抓取失败时，可在浏览器打开文章后复制网页源码/另存 HTML 内容到这里。"></textarea>
+        <label for="html">或粘贴文章正文 / HTML</label>
+        <textarea id="html" placeholder="更简单的方式：在浏览器打开文章，复制文章正文，粘贴到这里。也可以粘贴网页 HTML。"></textarea>
+        <div class="import-actions">
+          <button id="pasteClipboard" type="button">从剪贴板粘贴</button>
+        </div>
+        <div class="hint small">
+          遇到 WAF 521 时，直接复制文章正文粘贴即可，不需要使用浏览器导入书签。
+        </div>
 
         <div class="row">
           <div>
@@ -323,6 +387,7 @@ INDEX_HTML = r"""<!doctype html>
     const generateBtn = document.getElementById('generate');
     let lastPayload = null;
     let statusTimer = null;
+    let lastImportAt = '';
 
     function setStatus(message, kind = '') {
       statusEl.textContent = message;
@@ -338,6 +403,49 @@ INDEX_HTML = r"""<!doctype html>
     async function copyText(text) {
       await navigator.clipboard.writeText(text);
       setStatus('已复制到剪贴板', 'ok');
+    }
+
+    function buildBookmarklet() {
+      const importUrl = `${location.origin}/import`;
+      const importOrigin = location.origin;
+      const script = `(() => {
+        const data = {
+          source: 'csdn-annotation-tool',
+          url: location.href,
+          title: document.title,
+          html: document.documentElement.outerHTML
+        };
+        const win = window.open(${JSON.stringify(importUrl)}, 'csdn_annotation_import');
+        if (!win) {
+          alert('浏览器阻止了导入窗口，请允许弹出窗口后重试。');
+          return;
+        }
+        let attempts = 0;
+        const timer = setInterval(() => {
+          attempts += 1;
+          win.postMessage(data, ${JSON.stringify(importOrigin)});
+          if (attempts >= 20) clearInterval(timer);
+        }, 500);
+      })();`;
+      return 'javascript:' + encodeURIComponent(script);
+    }
+
+    async function loadBrowserImport(showEmptyMessage = true) {
+      const params = new URLSearchParams({ ts: String(Date.now()) });
+      if (lastImportAt) params.set('since', lastImportAt);
+      const response = await fetch('/api/import/latest?' + params.toString());
+      const payload = await response.json();
+      if (payload.unchanged) return Boolean(document.getElementById('html').value.trim());
+      if (!payload.html) {
+        if (showEmptyMessage) setStatus('暂未收到浏览器导入 HTML。', 'error');
+        return false;
+      }
+      if (payload.receivedAt === lastImportAt && !showEmptyMessage) return true;
+      lastImportAt = payload.receivedAt || '';
+      document.getElementById('url').value = payload.url || '';
+      document.getElementById('html').value = payload.html || '';
+      setStatus(`已导入浏览器页面 HTML：${payload.title || payload.url || '未识别标题'}`, 'ok');
+      return true;
     }
 
     function formatAll(payload) {
@@ -389,6 +497,11 @@ INDEX_HTML = r"""<!doctype html>
         setStatus('请填写文章 URL 或粘贴 HTML。', 'error');
         return;
       }
+      if (!body.html.trim()) {
+        await loadBrowserImport(false).catch(() => false);
+        body.url = document.getElementById('url').value.trim();
+        body.html = document.getElementById('html').value;
+      }
       generateBtn.disabled = true;
       const startedAt = Date.now();
       setStatus(body.useCodex ? '正在调用本机 Codex，通常需要 30-180 秒...' : '正在生成...');
@@ -423,6 +536,20 @@ INDEX_HTML = r"""<!doctype html>
       }
     });
 
+    document.getElementById('pasteClipboard').addEventListener('click', async () => {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (!text.trim()) {
+          setStatus('剪贴板里没有可用内容。请先在文章页面复制正文。', 'error');
+          return;
+        }
+        document.getElementById('html').value = text;
+        setStatus('已从剪贴板粘贴内容，可以点击生成。', 'ok');
+      } catch (error) {
+        setStatus('浏览器不允许读取剪贴板，请手动按 Ctrl+V 粘贴到文本框。', 'error');
+      }
+    });
+
     document.getElementById('clear').addEventListener('click', () => {
       document.getElementById('url').value = '';
       document.getElementById('html').value = '';
@@ -448,6 +575,93 @@ INDEX_HTML = r"""<!doctype html>
     copyAllBtn.addEventListener('click', () => {
       if (lastPayload) copyText(formatAll(lastPayload));
     });
+
+    loadBrowserImport(false).catch(() => {});
+    setInterval(() => {
+      loadBrowserImport(false).catch(() => {});
+    }, 2000);
+  </script>
+</body>
+</html>
+"""
+
+
+IMPORT_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CSDN 标注工具导入</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #f6f7fb;
+      color: #1f2937;
+      font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+      font-size: 14px;
+    }
+    main {
+      width: min(520px, calc(100vw - 32px));
+      background: #fff;
+      border: 1px solid #d8dee9;
+      border-radius: 8px;
+      padding: 22px;
+      line-height: 1.7;
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 18px;
+      font-weight: 650;
+    }
+    .status { color: #64748b; }
+    .ok { color: #047857; }
+    .error { color: #b91c1c; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>正在导入当前网页 HTML</h1>
+    <div id="status" class="status">请保持这个窗口打开，导入完成后会自动回到工具页面。</div>
+  </main>
+  <script>
+    const statusEl = document.getElementById('status');
+    let imported = false;
+
+    function setStatus(message, kind = '') {
+      statusEl.textContent = message;
+      statusEl.className = 'status ' + kind;
+    }
+
+    window.addEventListener('message', async (event) => {
+      if (imported) return;
+      const data = event.data || {};
+      if (!data || data.source !== 'csdn-annotation-tool' || !data.html) return;
+      imported = true;
+      setStatus('已收到网页 HTML，正在写入本地工具...');
+      try {
+        const response = await fetch('/api/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data)
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || '导入失败');
+        setStatus('导入完成，正在返回工具页面...', 'ok');
+        setTimeout(() => { location.href = '/?imported=1'; }, 700);
+      } catch (error) {
+        imported = false;
+        setStatus(error.message, 'error');
+      }
+    });
+
+    setTimeout(() => {
+      if (!imported) {
+        setStatus('还没有收到网页 HTML。请回到 CSDN 页面重新点击导入书签。');
+      }
+    }, 8000);
   </script>
 </body>
 </html>
@@ -458,24 +672,50 @@ class AnnotationHandler(BaseHTTPRequestHandler):
     server_version = "CSDNAnnotationUI/1.0"
 
     def do_GET(self) -> None:
-        if self.path in {"/", "/index.html"}:
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path in {"/", "/index.html"}:
             self._send_html(INDEX_HTML)
+            return
+        if path == "/import":
+            self._send_html(IMPORT_HTML)
+            return
+        if path == "/api/import/latest":
+            query = urllib.parse.parse_qs(parsed.query)
+            since = query.get("since", [""])[0]
+            self._send_json(latest_browser_import(since=since))
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
-        if self.path != "/api/generate":
+        path = urllib.parse.urlparse(self.path).path
+        if path not in {"/api/generate", "/api/import"}:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         try:
             payload = self._read_json()
-            result = generate(payload)
-            self._send_json(result)
+            if path == "/api/generate":
+                result = generate(payload)
+                self._send_json(result)
+                return
+            if path == "/api/import":
+                save_browser_import(payload)
+                self._send_json({"ok": True})
+                return
         except Exception as exc:
-            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            log_exception(exc)
+            self._send_json({"error": client_error_message(exc)}, status=error_status(exc))
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._send_cors_headers()
+        self.end_headers()
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+        try:
+            sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+        except Exception:
+            pass
 
     def _read_json(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -494,9 +734,78 @@ class AnnotationHandler(BaseHTTPRequestHandler):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self._send_cors_headers()
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _send_cors_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+
+def save_browser_import(payload: Dict[str, Any]) -> None:
+    page_html = str(payload.get("html") or "")
+    if not page_html.strip():
+        raise ValueError("浏览器导入失败：页面 HTML 为空。")
+    data = {
+        "url": str(payload.get("url") or "").strip(),
+        "title": str(payload.get("title") or "").strip(),
+        "html": page_html,
+        "receivedAt": datetime.now().isoformat(timespec="seconds"),
+    }
+    with BROWSER_IMPORT_LOCK:
+        BROWSER_IMPORT.clear()
+        BROWSER_IMPORT.update(data)
+    log_event(f"browser import received url={data['url'] or '<unknown>'} bytes={len(page_html)}")
+
+
+def latest_browser_import(since: str = "") -> Dict[str, Any]:
+    with BROWSER_IMPORT_LOCK:
+        data = dict(BROWSER_IMPORT)
+    if since and data.get("receivedAt") == since:
+        return {
+            "unchanged": True,
+            "url": data.get("url", ""),
+            "title": data.get("title", ""),
+            "receivedAt": data.get("receivedAt", ""),
+        }
+    return data
+
+
+def is_csdn_waf_error(exc: Exception) -> bool:
+    return (
+        isinstance(exc, urllib.error.HTTPError)
+        and exc.code == 521
+        and exc.headers.get("Server", "").upper() == "WAF"
+    )
+
+
+def normalize_article_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url.strip())
+    return urllib.parse.urlunparse(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path.rstrip("/"),
+            "",
+            "",
+            "",
+        )
+    )
+
+
+def latest_matching_import(url: str) -> Dict[str, Any]:
+    with BROWSER_IMPORT_LOCK:
+        data = dict(BROWSER_IMPORT)
+    page_html = str(data.get("html") or "")
+    if not page_html.strip():
+        return {}
+    imported_url = str(data.get("url") or "").strip()
+    if imported_url and normalize_article_url(imported_url) != normalize_article_url(url):
+        return {}
+    return data
 
 
 def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -512,8 +821,18 @@ def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
         page_html = raw_html
     elif url:
         log_event("fetch html start")
-        page_html = fetch_html(url, insecure=insecure)
-        log_event(f"fetch html done bytes={len(page_html)}")
+        try:
+            page_html = fetch_html(url, insecure=insecure)
+            log_event(f"fetch html done bytes={len(page_html)}")
+        except Exception as exc:
+            imported = latest_matching_import(url) if is_csdn_waf_error(exc) else {}
+            if not imported:
+                raise
+            page_html = str(imported["html"])
+            log_event(
+                "fetch html blocked by CSDN WAF; "
+                f"using browser import receivedAt={imported.get('receivedAt', '')} bytes={len(page_html)}"
+            )
     else:
         raise ValueError("请填写文章 URL 或粘贴 HTML。")
 
@@ -858,12 +1177,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
     server = ThreadingHTTPServer((args.host, args.port), AnnotationHandler)
-    print(f"CSDN 标注草稿界面已启动: http://{args.host}:{args.port}")
-    print("按 Ctrl+C 停止服务。")
+    safe_console_print(f"CSDN 标注草稿界面已启动: http://{args.host}:{args.port}")
+    safe_console_print("按 Ctrl+C 停止服务。")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n服务已停止。")
+        safe_console_print("\n服务已停止。")
     finally:
         server.server_close()
     return 0
